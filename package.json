@@ -1,0 +1,20 @@
+{
+  "name": "pi-codex-bridge",
+  "version": "0.1.0",
+  "description": "Use OpenAI Codex as a first-class model provider in pi-coding-agent — codex/* in the model picker, the way pi-claude-bridge exposes Claude Code. Not a skill.",
+  "type": "module",
+  "license": "MIT",
+  "author": "ShyftXero <emcrae@synoptek.com>",
+  "repository": { "type": "git", "url": "git+https://github.com/ShyftXero/pi-codex-bridge.git" },
+  "homepage": "https://github.com/ShyftXero/pi-codex-bridge#readme",
+  "keywords": ["pi", "pi-coding-agent", "codex", "openai", "provider", "bridge", "llm"],
+  "pi": { "extensions": ["./src/index.ts"] },
+  "files": ["src", "README.md", "LICENSE"],
+  "scripts": {
+    "test": "node test/selfcheck.mjs"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-ai": ">=0.86.1",
+    "@earendil-works/pi-coding-agent": ">=0.86.1"
+  }
+}
