@@ -12,6 +12,9 @@
 
 import { spawn } from "node:child_process";
 import * as readline from "node:readline";
+import { existsSync } from "node:fs";
+import { homedir } from "node:os";
+import { join } from "node:path";
 import {
 	createAssistantMessageEventStream,
 	type AssistantMessage,
@@ -24,8 +27,12 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
 const PROVIDER_ID = "codex";
 const API = "codex-bridge";
-/** Override the codex binary (devcell installs it under ~/.local/node/bin, often off PATH). */
-const CODEX_BIN = process.env.PI_CODEX_BIN ?? "codex";
+/** The codex binary. Honor PI_CODEX_BIN, else probe common install dirs (codex is
+ *  often off PATH — e.g. ~/.local/node/bin), else fall back to PATH lookup. */
+const CODEX_BIN =
+	process.env.PI_CODEX_BIN ??
+	[join(homedir(), ".local/node/bin/codex"), join(homedir(), ".local/bin/codex")].find((p) => existsSync(p)) ??
+	"codex";
 
 // `default` = codex's own account/config default (spawned WITHOUT -m). A ChatGPT-account
 // codex rejects every explicit `-m`, so `default` is the only id that works there; the
