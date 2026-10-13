@@ -25,12 +25,13 @@ function serializePrompt(context) {
 	const parts = [];
 	if (context.systemPrompt) parts.push(`# System\n${context.systemPrompt}`);
 	for (const msg of context.messages) {
-		const text = (msg.content ?? []).map((b) => {
+		const raw = msg.content;
+		const text = typeof raw === "string" ? raw : Array.isArray(raw) ? raw.map((b) => {
 			if (b.type === "text") return b.text ?? "";
 			if (b.type === "toolCall") return `[called ${b.name ?? "tool"}]`;
 			if (b.type === "toolResult") return `[tool result] ${blockText(b.content)}`;
 			return "";
-		}).filter(Boolean).join("\n");
+		}).filter(Boolean).join("\n") : "";
 		if (text.trim()) parts.push(`# ${msg.role}\n${text}`);
 	}
 	return parts.join("\n\n");
@@ -59,12 +60,14 @@ assert.deepStrictEqual(parseCodexLine(`{"type":"error","message":"boom"}`), { ki
 const prompt = serializePrompt({
 	systemPrompt: "be terse",
 	messages: [
+		{ role: "user", content: "plain string content" }, // real pi sends string content too
 		{ role: "user", content: [{ type: "text", text: "hi" }] },
 		{ role: "assistant", content: [{ type: "toolCall", name: "bash" }] },
 		{ role: "user", content: [{ type: "toolResult", content: [{ type: "text", text: "done" }] }] },
 	],
 });
 assert.match(prompt, /# System\nbe terse/);
+assert.match(prompt, /plain string content/);
 assert.match(prompt, /# user\nhi/);
 assert.match(prompt, /\[called bash\]/);
 assert.match(prompt, /\[tool result\] done/);

@@ -80,16 +80,23 @@ export function serializePrompt(context: Pick<Context, "messages" | "systemPromp
 	const parts: string[] = [];
 	if (context.systemPrompt) parts.push(`# System\n${context.systemPrompt}`);
 	for (const msg of context.messages) {
-		const text = ((msg as { content?: unknown[] }).content ?? [])
-			.map((b) => {
-				const block = b as { type?: string; text?: string; name?: string; content?: unknown };
-				if (block.type === "text") return block.text ?? "";
-				if (block.type === "toolCall") return `[called ${block.name ?? "tool"}]`;
-				if (block.type === "toolResult") return `[tool result] ${blockText(block.content)}`;
-				return "";
-			})
-			.filter(Boolean)
-			.join("\n");
+		const raw = (msg as { content?: unknown }).content;
+		// pi messages carry content as a plain string OR an array of typed blocks.
+		const text =
+			typeof raw === "string"
+				? raw
+				: Array.isArray(raw)
+					? raw
+						.map((b) => {
+							const block = b as { type?: string; text?: string; name?: string; content?: unknown };
+							if (block.type === "text") return block.text ?? "";
+							if (block.type === "toolCall") return `[called ${block.name ?? "tool"}]`;
+							if (block.type === "toolResult") return `[tool result] ${blockText(block.content)}`;
+							return "";
+						})
+						.filter(Boolean)
+						.join("\n")
+					: "";
 		if (text.trim()) parts.push(`# ${msg.role}\n${text}`);
 	}
 	return parts.join("\n\n");
