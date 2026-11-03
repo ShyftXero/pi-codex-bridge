@@ -38,9 +38,14 @@ MCP handler to block mid-turn. Hence two phases:
   call). **Ceiling: pi does not drive codex's tools.** Codex edits files and runs commands out-of-band
   in the working directory; pi sees the resulting text, not individual tool calls.
 
-- **v0.2 (planned)** runs codex under its long-lived `app-server`/`exec-server` protocol with an
-  in-process MCP server exposing pi's tools and codex's native tools disabled — reproducing the
-  claude-bridge coroutine so **pi owns the tool loop**.
+- **v0.2 (in progress, opt-in)** runs codex under its long-lived `app-server` protocol so **pi owns
+  the tool loop**. codex's app-server has a *native* client-owned tool loop (`item/tool/call` →
+  `DynamicToolCallParams`), so this does NOT need the in-process MCP server / schema-flattening /
+  stdin-steer machinery pi-claude-bridge needed — it's a ~400-line newline-JSON-RPC bridge. Enable
+  with `PI_CODEX_APPSERVER=1` (default stays v0.1 until the app-server tool-loop is verified
+  end-to-end against a logged-in codex). The one empirical unknown — how codex registers
+  client-side `DynamicToolSpec`s + disables native tools — is resolved by `npm run probe` on a
+  machine with a live `codex login` (see `probe/appserver-probe.mjs`).
 
 ## Safety
 

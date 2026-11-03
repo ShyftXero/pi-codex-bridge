@@ -24,6 +24,7 @@ import {
 	type SimpleStreamOptions,
 } from "@earendil-works/pi-ai";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { streamCodexAppServer } from "./appserver.js";
 
 const PROVIDER_ID = "codex";
 const API = "codex-bridge";
@@ -219,12 +220,16 @@ async function runCodex(
 	child.on("close", finish);
 }
 
+// v0.2 (app-server, Pi owns the tool loop) is opt-in behind PI_CODEX_APPSERVER=1
+// until the hhr probe confirms the dynamic-tool registration seam. v0.1 default.
+const streamFn = process.env.PI_CODEX_APPSERVER === "1" ? streamCodexAppServer : streamCodex;
+
 export default function activate(pi: ExtensionAPI): void {
 	pi.registerProvider(PROVIDER_ID, {
 		baseUrl: API,
 		apiKey: "not-used", // codex authenticates itself (ChatGPT OAuth in ~/.codex/auth.json)
 		api: API,
 		models: registeredModels(),
-		streamSimple: streamCodex as unknown,
+		streamSimple: streamFn as unknown,
 	} as Parameters<ExtensionAPI["registerProvider"]>[1]);
 }
