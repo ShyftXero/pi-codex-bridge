@@ -59,14 +59,21 @@ export interface ParkedResult {
 }
 
 export function parkedToolResult(context: Pick<Context, "messages">): ParkedResult | null {
-	const last = context.messages.at(-1);
-	if (last?.role !== "toolResult") return null;
+	// Walk backward to find the nearest toolResult before the last assistant turn boundary.
+	// User steer/followUp messages may appear after a toolResult, so the tail is not always the result itself.
+	let tr: any | null = null;
+	for (let i = context.messages.length - 1; i >= 0; i--) {
+		const m: any = (context as any).messages[i];
+		if (m?.role === "toolResult") { tr = m; break; }
+		if (m?.role === "assistant") break; // stop at the previous assistant turn boundary
+	}
+	if (!tr) return null;
 	return {
-		callId: last.toolCallId,
-		success: !last.isError,
-		contentItems: last.content.map((block) => block.type === "image"
+		callId: tr.toolCallId,
+		success: !tr.isError,
+		contentItems: (tr.content ?? []).map((block: any) => block.type === "image"
 			? { type: "inputImage" as const, imageUrl: `data:${block.mimeType};base64,${block.data}` }
-			: { type: "inputText" as const, text: block.text }),
+			: { type: "inputText" as const, text: String(block.text ?? "") }),
 	};
 }
 
@@ -393,19 +400,21 @@ async function run(model: Model<any>, context: Context, options: SimpleStreamOpt
 		const parked = parkedToolResult(context);
 		if (parked) {
 			session = sessionsByCall.get(parked.callId);
-			if (!session || session.disposed) throw new Error("Codex tool continuation is unavailable. Start a new user turn.");
-			const held = session.held!;
-			sessionsByCall.delete(parked.callId);
-			session.held = null;
-			session.stream = stream;
-			session.out = newOut(model, "stop");
-			session.settled = false;
-			session.tools = new Set(currentTools(context).map((t) => t.name));
-			bindAbort(session, model, options?.signal);
-			if (session.disposed) return;
-			session.conn.respond(held.requestId, { contentItems: parked.contentItems, success: parked.success });
-			pump(session, model);
-			return;
+			if (session && !session.disposed) {
+				const held = session.held!;
+				sessionsByCall.delete(parked.callId);
+				session.held = null;
+				session.stream = stream;
+				session.out = newOut(model, "stop");
+				session.settled = false;
+				session.tools = new Set(currentTools(context).map((t) => t.name));
+				bindAbort(session, model, options?.signal);
+				if (session.disposed) return;
+				session.conn.respond(held.requestId, { contentItems: parked.contentItems, success: parked.success });
+				pump(session, model);
+				return;
+			}
+			// Fallback: sessionsByCall entry is missing (e.g., after a restart). Do not throw; start a fresh turn below.
 		}
 		if (options?.signal?.aborted) throw new Error("Operation aborted");
 		const tools = currentTools(context);
