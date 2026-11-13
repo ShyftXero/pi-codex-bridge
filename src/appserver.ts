@@ -297,13 +297,14 @@ function newOut(model: Model<any>, stopReason: AssistantMessage["stopReason"], e
 
 /** Namespacing avoids collisions with native tools and keeps HUD names intact in Pi. */
 export function threadStartParams(cwd: string, model: Model<any>, tools: PiTool[]) {
+	const dyn = toDynamicToolSpecs(tools);
 	return {
 		cwd,
 		...(model.id && model.id !== "default" ? { model: model.id } : {}),
 		approvalPolicy: "never",
 		sandbox: "read-only",
 		ephemeral: true,
-		dynamicTools: [{ type: "namespace", name: "pi", description: "Tools provided by the Pi harness", tools: toDynamicToolSpecs(tools) }],
+		...(dyn.length ? { dynamicTools: [{ type: "namespace", name: "pi", description: "Tools provided by the Pi harness", tools: dyn }] } : {}),
 		developerInstructions: "Use the pi namespace for all tool operations. Pi executes these tools with the calling session's permissions.",
 		// Native command execution must not bypass Pi's tool filters or approvals.
 		config: { "features.shell_tool": false, "features.multi_agent": false, web_search: "disabled" },
