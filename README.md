@@ -1,51 +1,45 @@
 # pi-codex-bridge
 
-Use **OpenAI Codex** as a first-class model provider in
-[pi-coding-agent](https://pi.dev) — `codex/*` shows up in the model picker and is selectable
-per-persona, exactly the way [`pi-claude-bridge`](https://github.com/elidickinson/pi-claude-bridge)
-exposes Claude Code.
+Codex model provider for Pi. Codex must be installed and authenticated with `codex login`.
+Set `PI_CODEX_BIN` if Codex is outside PATH.
 
-This is a **model provider**, not a skill or a "delegate a task to codex" tool.
+## Tool forwarding
 
-## Install
+The default provider uses `codex app-server` and forwards the calling Pi session's active tools.
+Tools appear under the `pi` namespace. Pi receives each tool call and executes it through its normal
+validation, callbacks and approval handling. Tool results resume the same Codex turn.
 
-```jsonc
-// ~/.pi/agent/settings.json
-{ "packages": ["npm:pi-codex-bridge"] }
+The bridge enables the experimental protocol capability, sends the `initialized` notification, and
+registers `dynamicTools` on `thread/start`. These fields are documented at
+https://developers.openai.com/codex/app-server and match the installed CLI's experimental JSON schema.
+This requires a Codex version supporting namespaced dynamic tools.
+
+The bridge preserves error results and images. It buffers concurrent tool requests while Pi executes
+each call. Process failures and unsupported server requests end the stream with an error.
+A cancelled or lost tool continuation returns an error. Start a new user turn to recover.
+
+Each fresh Pi turn seeds a new Codex thread with Pi's history. Codex threads are ephemeral.
+Native command execution is disabled. The Codex sandbox is read-only. Forwarded tools still execute
+in Pi and retain the calling session's permissions.
+
+`PI_CODEX_APPSERVER=0` enables legacy `codex exec --json` only when Pi supplies no tools.
+A session with active Pi tools always uses app-server. There is no silent fallback that drops tools.
+
+## Verification
+
+Run tests on a development or test node. Do not run them on the live HUD host.
+Install the package's Pi peer dependencies first. Use Node 22.23.3 or later.
+
+```sh
+node --experimental-strip-types --test test/tool-forwarding.test.mjs
 ```
 
-Codex must be installed and authenticated (`codex login` — ChatGPT subscription or an API key;
-auth lives in `~/.codex/auth.json`). If the `codex` binary isn't on `PATH`, point to it:
+The tests import the real bridge and launch a fake app-server. They use no inference or credentials.
+They cover the handshake, tool registration, results, errors, images, concurrent calls, independent
+sessions, cancellation, process exit and missing continuations.
 
-```bash
-export PI_CODEX_BIN=/home/you/.local/node/bin/codex
-```
-
-Then pick a model: `codex/gpt-5-codex`, `codex/gpt-5`, `codex/o3`.
-
-## How it works — and the v0.1 ceiling
-
-`pi-claude-bridge` runs the model as a **pure LLM** (`tools: []`) and exposes *pi's* tools to it via
-an in-process MCP server, so **pi owns the tool loop**. That depends on Claude Code's SDK having one
-long-lived, resumable streaming session into which the MCP handler can block.
-
-`codex exec --json` is **oneshot per turn** (a fresh process each turn), so there's nowhere for an
-MCP handler to block mid-turn. Hence two phases:
-
-- **v0.1 (this release)** drives `codex exec --json`. Codex runs as its **own agent** — its native
-  tools (bash, apply-patch) in a `workspace-write` sandbox — and pi receives the agent's text output.
-  pi's transcript is serialized to a prompt each turn (pi owns history; the provider is stateless per
-  call). **Ceiling: pi does not drive codex's tools.** Codex edits files and runs commands out-of-band
-  in the working directory; pi sees the resulting text, not individual tool calls.
-
-- **v0.2 (planned)** runs codex under its long-lived `app-server`/`exec-server` protocol with an
-  in-process MCP server exposing pi's tools and codex's native tools disabled — reproducing the
-  claude-bridge coroutine so **pi owns the tool loop**.
-
-## Safety
-
-v0.1 runs codex with `--sandbox workspace-write` in pi's current working directory. Codex can create
-and modify files there and run sandboxed commands. Run it where you'd run codex itself.
+After the tests pass, verify an authenticated Codex session can call `pi.dispatch` and `pi.long_task`
+and receive their results. Verify the HUD attributes each call to the calling session.
 
 ## License
 
