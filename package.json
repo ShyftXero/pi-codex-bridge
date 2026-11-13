@@ -12,7 +12,8 @@
   "files": ["src", "README.md", "LICENSE"],
   "scripts": {
     "test": "node test/selfcheck.mjs && node --experimental-strip-types --test test/tool-forwarding.test.mjs",
-    "probe": "node --experimental-strip-types probe/appserver-probe.mjs"
+    "probe": "node --experimental-strip-types probe/appserver-probe.mjs",
+    "probe-thinking": "node --experimental-strip-types probe/appserver-thinking-probe.mjs"
   },
   "peerDependencies": {
     "@earendil-works/pi-ai": ">=0.86.1",
