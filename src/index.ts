@@ -1,15 +1,4 @@
-// pi-codex-bridge — OpenAI Codex as a first-class pi model provider.
-//
-// Mirrors pi-claude-bridge's provider surface (pi.registerProvider + a streamSimple
-// that streams AssistantMessage events) so `codex/*` shows up in the model picker like
-// `claude-bridge/*`. v0.1 (this file) drives `codex exec --json`: codex runs as its OWN
-// agent (native tools, workspace-write sandbox); pi sees the agent's text output.
-//
-// ponytail: v0.1 does NOT let pi drive codex's tools — codex owns its loop out-of-band.
-// The faithful "pi owns the tool loop via an in-process MCP server" port (the way
-// claude-bridge coerces a pure LLM with tools:[]) needs codex's long-lived
-// app-server/exec-server protocol and lands in v0.2. See README + issue #105.
-
+// Codex model provider. App-server forwards Pi tools by default.
 import { spawn } from "node:child_process";
 import * as readline from "node:readline";
 import { existsSync } from "node:fs";
@@ -24,7 +13,7 @@ import {
 	type SimpleStreamOptions,
 } from "@earendil-works/pi-ai";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { streamCodexAppServer } from "./appserver.js";
+import { currentTools, streamCodexAppServer } from "./appserver.js";
 
 const PROVIDER_ID = "codex";
 const API = "codex-bridge";
@@ -220,9 +209,13 @@ async function runCodex(
 	child.on("close", finish);
 }
 
-// v0.2 (app-server, Pi owns the tool loop) is opt-in behind PI_CODEX_APPSERVER=1
-// until the hhr probe confirms the dynamic-tool registration seam. v0.1 default.
-const streamFn = process.env.PI_CODEX_APPSERVER === "1" ? streamCodexAppServer : streamCodex;
+
+// Tool forwarding is the default. Legacy exec is only available for tool-free calls.
+// Never silently discard Pi tools, even when an operator requests legacy mode.
+const streamFn = (model: Model<any>, context: Context, options?: SimpleStreamOptions) =>
+	process.env.PI_CODEX_APPSERVER === "0" && currentTools(context).length === 0
+		? streamCodex(model, context, options)
+		: streamCodexAppServer(model, context, options);
 
 export default function activate(pi: ExtensionAPI): void {
 	pi.registerProvider(PROVIDER_ID, {

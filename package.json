@@ -11,8 +11,8 @@
   "pi": { "extensions": ["./src/index.ts"] },
   "files": ["src", "README.md", "LICENSE"],
   "scripts": {
-    "test": "node test/selfcheck.mjs && node test/appserver-selfcheck.mjs",
-    "probe": "node probe/appserver-probe.mjs"
+    "test": "node test/selfcheck.mjs && node --experimental-strip-types --test test/tool-forwarding.test.mjs",
+    "probe": "node --experimental-strip-types probe/appserver-probe.mjs"
   },
   "peerDependencies": {
     "@earendil-works/pi-ai": ">=0.86.1",

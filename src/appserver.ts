@@ -1,27 +1,14 @@
-// pi-codex-bridge v0.2 — faithful app-server port: Pi owns the tool loop.
-//
-// v0.1 (index.ts) runs `codex exec --json` as its own agent (codex drives its own
-// tools). v0.2 runs `codex app-server` — codex's long-lived JSON-RPC-over-stdio
-// protocol — with codex's NATIVE tools off and Pi's tools registered as
-// DynamicToolSpecs. codex then asks US to run a tool (ServerRequest
-// `item/tool/call`), which is exactly "Pi owns the tool loop" without the
-// in-process MCP server / schema-flattening / stdin-FIFO-steer machinery that
-// pi-claude-bridge needed (CC's SDK had no native client tool loop; codex does).
-//
-// Framing is newline-delimited JSON-RPC 2.0 (verified against codex-cli 0.162.1:
-// one object per line, `\n`-terminated; server notifications arrive id-less).
-//
-// GATED: index.ts only wires this in when PI_CODEX_APPSERVER=1, so v0.1 stays the
-// default export until the probe (probe/appserver-probe.mjs) confirms the one
-// unverified seam — registerToolsAndStartThread() — on a `codex login`'d hhr node.
-// Do NOT flip the default before that run. See plan feat-509-codex-bridge-v0.2.md.
-
+// Codex app-server bridge. Pi executes forwarded tools and owns their results.
 import { spawn, type ChildProcess } from "node:child_process";
 import * as readline from "node:readline";
-import { randomUUID } from "node:crypto";
+import { existsSync } from "node:fs";
+import { homedir } from "node:os";
+import { join } from "node:path";
 import {
 	createAssistantMessageEventStream,
 	getCurrentTools,
+	getCurrentSystemPrompt,
+	normalizeContext,
 	type AssistantMessage,
 	type AssistantMessageEventStream,
 	type Context,
@@ -64,34 +51,36 @@ export function toTurnInput(text: string): Array<{ type: "text"; text: string; t
 	return [{ type: "text", text, text_elements: [] }];
 }
 
-/** The tail of context.messages is a tool result iff its last message is role
- *  "tool"/"user" carrying a toolResult block. Returns the codex callId (== the Pi
- *  toolCall.id we stamped) + flattened text, or null for a fresh user turn. This
- *  is how a tool-loop continuation is told apart from a new turn — by the parked
- *  callId, never by order. */
-export function parkedToolResult(context: Pick<Context, "messages">): { callId: string; text: string } | null {
-	const last = context.messages[context.messages.length - 1] as { role?: string; content?: unknown } | undefined;
-	if (!last) return null;
-	const blocks = Array.isArray(last.content) ? last.content : [];
-	for (let i = blocks.length - 1; i >= 0; i--) {
-		const b = blocks[i] as { type?: string; toolCallId?: string; content?: unknown };
-		if (b?.type === "toolResult" && typeof b.toolCallId === "string") {
-			return { callId: b.toolCallId, text: flattenContent(b.content) };
-		}
-	}
-	return null;
+/** Pi returns tool results as top-level messages, including errors and images. */
+export interface ParkedResult {
+	callId: string;
+	contentItems: Array<{ type: "inputText"; text: string } | { type: "inputImage"; imageUrl: string }>;
+	success: boolean;
 }
 
-/** Full prior history as plain text, used to seed a FRESH codex thread per Pi turn.
- *  ponytail: cross-turn codex-side context is NOT reused — Pi's re-sent history is
- *  the source of truth, re-seeded each turn (matches v0.1's statelessness). Ceiling:
- *  no codex-side prompt cache across Pi turns. Upgrade: persistent thread +
- *  session-sync if caching ever matters. The tool LOOP (v0.2's point) stays within
- *  one codex turn, so it is unaffected. */
+export function parkedToolResult(context: Pick<Context, "messages">): ParkedResult | null {
+	const last = context.messages.at(-1);
+	if (last?.role !== "toolResult") return null;
+	return {
+		callId: last.toolCallId,
+		success: !last.isError,
+		contentItems: last.content.map((block) => block.type === "image"
+			? { type: "inputImage" as const, imageUrl: `data:${block.mimeType};base64,${block.data}` }
+			: { type: "inputText" as const, text: block.text }),
+	};
+}
+
+/** Pi history seeds each fresh Codex turn. Tool continuations reuse the held turn. */
 export function serializeHistory(context: Pick<Context, "messages" | "systemPrompt">): string {
 	const parts: string[] = [];
-	if (context.systemPrompt) parts.push(`# System\n${context.systemPrompt}`);
+	const systemPrompt = getCurrentSystemPrompt(normalizeContext(context).messages);
+	if (systemPrompt) parts.push(`# System\n${systemPrompt}`);
 	for (const msg of context.messages) {
+		if (msg.role === "system") continue;
+		if (msg.role === "toolResult") {
+			parts.push(`# tool result ${msg.toolName} (${msg.isError ? "error" : "success"})\n${flattenContent(msg.content)}`);
+			continue;
+		}
 		const raw = (msg as { content?: unknown; role?: string }).content;
 		const text =
 			typeof raw === "string"
@@ -174,8 +163,13 @@ export function mapCodexMessage(
 				contextWindow: typeof u.modelContextWindow === "number" ? u.modelContextWindow : null,
 			};
 		}
-		case "turn/completed":
+		case "turn/completed": {
+			const turn = params.turn as { status?: string; error?: { message?: string } } | undefined;
+			if (turn?.status && turn.status !== "completed") {
+				return { kind: "error", message: turn.error?.message ?? `Codex turn ${turn.status}` };
+			}
 			return { kind: "turnDone" };
+		}
 		case "error":
 		case "turn/error": {
 			const err = (params.error ?? params) as { message?: unknown };
@@ -189,198 +183,124 @@ export function mapCodexMessage(
 function tokenTotal(breakdown: unknown): number {
 	if (!breakdown || typeof breakdown !== "object") return 0;
 	const b = breakdown as Record<string, unknown>;
-	return ["input", "output", "cacheRead", "cacheWrite", "cached", "total"]
+	if (typeof b.totalTokens === "number") return b.totalTokens;
+	return ["inputTokens", "outputTokens"]
 		.map((k) => (typeof b[k] === "number" ? (b[k] as number) : 0))
 		.reduce((a, c) => a + c, 0);
 }
 
 type RequestId = number | string;
 
-// --- JSON-RPC-over-stdio transport (newline-delimited, verified framing) ---------
-
+/** Child exit, spawn failure and broken stdin reject all outstanding RPCs. */
 class AppServerConn {
 	private proc: ChildProcess;
 	private nextId = 1;
-	private pending = new Map<RequestId, { resolve: (v: unknown) => void; reject: (e: Error) => void }>();
-	/** notifications + ServerRequests (id-less OR server-initiated with an id). */
+	private failure: Error | null = null;
+	private pending = new Map<RequestId, { resolve: (v: unknown) => void; reject: (e: Error) => void; timer: ReturnType<typeof setTimeout> }>();
 	onMessage: (msg: Record<string, unknown>) => void = () => {};
-	onStderr: (s: string) => void = () => {};
+	onFailure: (err: Error) => void = () => {};
 
-	constructor(bin: string, args: string[]) {
-		this.proc = spawn(bin, args, { stdio: ["pipe", "pipe", "pipe"], env: process.env });
+	constructor(bin: string) {
+		this.proc = spawn(bin, ["app-server"], { stdio: ["pipe", "pipe", "pipe"], env: process.env });
 		readline.createInterface({ input: this.proc.stdout! }).on("line", (line) => {
-			if (!line.trim()) return;
 			let msg: Record<string, unknown>;
-			try {
-				msg = JSON.parse(line);
-			} catch {
-				return; // malformed line — ignore (matches v0.1 tolerance)
-			}
-			// A reply to one of OUR requests resolves its promise. A server-initiated
-			// request (e.g. item/tool/call) also has an id but carries `method`.
+			try { msg = JSON.parse(line); } catch { return; }
 			if (msg.id !== undefined && msg.method === undefined) {
 				const waiter = this.pending.get(msg.id as RequestId);
 				if (waiter) {
 					this.pending.delete(msg.id as RequestId);
+					clearTimeout(waiter.timer);
 					if (msg.error) waiter.reject(new Error(JSON.stringify(msg.error)));
 					else waiter.resolve(msg.result);
-					return;
 				}
+				return;
 			}
 			this.onMessage(msg);
 		});
-		this.proc.stderr?.on("data", (d: Buffer) => this.onStderr(d.toString()));
+		let stderr = "";
+		this.proc.stderr?.on("data", (d: Buffer) => { stderr = (stderr + d.toString()).slice(-2000); });
+		this.proc.on("error", (err) => this.fail(err));
+		this.proc.stdin?.on("error", (err) => this.fail(err));
+		this.proc.on("close", (code, signal) => this.fail(new Error(`Codex app-server closed (${signal ?? code}): ${stderr}`)));
+	}
+
+	private fail(err: Error): void {
+		if (this.failure) return;
+		this.failure = err;
+		for (const waiter of this.pending.values()) {
+			clearTimeout(waiter.timer);
+			waiter.reject(err);
+		}
+		this.pending.clear();
+		this.onFailure(err);
 	}
 
 	request(method: string, params: unknown): Promise<unknown> {
+		if (this.failure) return Promise.reject(this.failure);
 		const id = this.nextId++;
-		this.write({ jsonrpc: "2.0", id, method, params });
-		return new Promise((resolve, reject) => this.pending.set(id, { resolve, reject }));
+		return new Promise((resolve, reject) => {
+			const timer = setTimeout(() => {
+				this.pending.delete(id);
+				reject(new Error(`Codex RPC timed out: ${method}`));
+			}, 30_000);
+			this.pending.set(id, { resolve, reject, timer });
+			try { this.write({ id, method, params }); }
+			catch (err) { this.fail(err instanceof Error ? err : new Error(String(err))); }
+		});
 	}
 
-	/** Reply to a server-initiated ServerRequest (e.g. item/tool/call). */
-	respond(id: RequestId, result: unknown): void {
-		this.write({ jsonrpc: "2.0", id, result });
-	}
-
-	notify(method: string, params: unknown): void {
-		this.write({ jsonrpc: "2.0", method, params });
-	}
+	respond(id: RequestId, result: unknown): void { this.write({ id, result }); }
+	notify(method: string, params: unknown): void { this.write({ method, params }); }
 
 	private write(obj: unknown): void {
-		this.proc.stdin?.write(JSON.stringify(obj) + "\n");
+		if (this.failure) throw this.failure;
+		this.proc.stdin!.write(JSON.stringify(obj) + "\n");
 	}
 
 	kill(): void {
-		this.pending.forEach((w) => w.reject(new Error("app-server closed")));
-		this.pending.clear();
+		this.fail(new Error("Codex app-server disposed"));
 		this.proc.kill("SIGTERM");
 	}
 }
 
-// --- session: one codex thread per Pi turn-chain --------------------------------
-
 interface Session {
 	conn: AppServerConn;
-	threadId: string;
-	turnId: string | null;
-	/** codex ServerRequest id for a tool call we told Pi about but have not answered. */
-	heldToolCall: { callId: string; requestId: RequestId } | null;
-	stream: AssistantMessageEventStream; // the CURRENT Pi stream to push into
+	stream: AssistantMessageEventStream;
 	out: AssistantMessage;
-	contentIndex: number;
+	threadId: string;
+	held: { callId: string; requestId: RequestId } | null;
+	inbox: Record<string, unknown>[];
 	settled: boolean;
+	disposed: boolean;
+	clearAbort: () => void;
+	tools: Set<string>;
 }
 
-// Continuation lookup: a streamSimple call whose tail is a tool result for this
-// callId resolves into the owning session. Keyed by the codex callId we stamped
-// onto the Pi toolCall.id.
 const sessionsByCall = new Map<string, Session>();
-
-const CODEX_BIN = process.env.PI_CODEX_BIN ?? "codex";
+const CODEX_BIN = process.env.PI_CODEX_BIN ??
+	[join(homedir(), ".local/node/bin/codex"), join(homedir(), ".local/bin/codex")].find(existsSync) ?? "codex";
 
 function newOut(model: Model<any>, stopReason: AssistantMessage["stopReason"], errorMessage?: string): AssistantMessage {
 	return {
-		role: "assistant",
-		content: [],
-		api: model.api,
-		provider: model.provider,
-		model: model.id,
+		role: "assistant", content: [], api: model.api, provider: model.provider, model: model.id,
 		usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
-		stopReason,
-		...(errorMessage ? { errorMessage } : {}),
-		timestamp: Date.now(),
-	} as AssistantMessage;
+		stopReason, ...(errorMessage ? { errorMessage } : {}), timestamp: Date.now(),
+	};
 }
 
-/**
- * THE ONE UNVERIFIED SEAM. `DynamicToolSpec` is exported by the protocol but not
- * wired into any typed request param; the registration path (+ the native-tools-off
- * switch) is one of: thread/start `config` passthrough, experimentalFeature flag,
- * or a `-c` config override at spawn. codex is a Rust binary (can't grep), so the
- * probe resolves this on a live hhr node and this function is finalized from its
- * output. Current best guess: config passthrough on thread/start.
- */
-async function registerToolsAndStartThread(conn: AppServerConn, cwd: string, model: Model<any>, tools: PiTool[]): Promise<string> {
-	await conn.request("initialize", { clientInfo: { name: "pi-codex-bridge", title: "pi-codex-bridge", version: "0.2.0" }, capabilities: null });
-	// TODO(hhr-probe): confirm the dynamicTools + native-tools-off keys. The probe
-	// tries each candidate and prints the one that makes codex emit item/tool/call.
-	const res = (await conn.request("thread/start", {
+/** Namespacing avoids collisions with native tools and keeps HUD names intact in Pi. */
+export function threadStartParams(cwd: string, model: Model<any>, tools: PiTool[]) {
+	return {
 		cwd,
 		...(model.id && model.id !== "default" ? { model: model.id } : {}),
 		approvalPolicy: "never",
-		sandbox: "workspace-write",
-		config: {
-			dynamic_tools: toDynamicToolSpecs(tools), // candidate (a)
-			tools: { shell: false, apply_patch: false }, // native tools off (candidate shape)
-		},
-	})) as { thread?: { id?: string }; threadId?: string };
-	const threadId = res?.thread?.id ?? res?.threadId;
-	if (!threadId) throw new Error("thread/start returned no thread id");
-	return threadId;
-}
-
-function drive(session: Session, model: Model<any>, options?: SimpleStreamOptions): void {
-	session.conn.onMessage = (msg) => {
-		if (session.settled) return;
-		const action = mapCodexMessage(msg);
-		if (!action) return;
-		switch (action.kind) {
-			case "text": {
-				const ci = session.contentIndex++;
-				(session.out.content as Array<{ type: string; text: string }>).push({ type: "text", text: action.delta });
-				session.stream.push({ type: "text_start", contentIndex: ci, partial: session.out });
-				session.stream.push({ type: "text_delta", contentIndex: ci, delta: action.delta, partial: session.out });
-				session.stream.push({ type: "text_end", contentIndex: ci, content: action.delta, partial: session.out });
-				break;
-			}
-			case "thinking": {
-				const ci = session.contentIndex++;
-				session.stream.push({ type: "thinking_start", contentIndex: ci, partial: session.out } as never);
-				session.stream.push({ type: "thinking_delta", contentIndex: ci, delta: action.delta, partial: session.out } as never);
-				session.stream.push({ type: "thinking_end", contentIndex: ci, content: action.delta, partial: session.out } as never);
-				break;
-			}
-			case "usage":
-				session.out.usage = {
-					...session.out.usage,
-					output: action.last,
-					totalTokens: action.total,
-				} as AssistantMessage["usage"];
-				break;
-			case "toolcall": {
-				// Pi owns the loop: tell Pi to run the tool, park codex's request.
-				const ci = session.contentIndex++;
-				const toolCall = { type: "toolCall", id: action.callId, name: action.tool, arguments: action.args, ...(action.namespace ? { namespace: action.namespace } : {}) };
-				(session.out.content as unknown[]).push(toolCall);
-				session.stream.push({ type: "toolcall_start", contentIndex: ci, id: action.callId, toolName: action.tool } as never);
-				session.stream.push({ type: "toolcall_delta", contentIndex: ci, delta: JSON.stringify(action.args ?? {}) } as never);
-				session.stream.push({ type: "toolcall_end", contentIndex: ci, toolCall } as never);
-				session.heldToolCall = { callId: action.callId, requestId: action.id };
-				sessionsByCall.set(action.callId, session);
-				settle(session, { type: "done", reason: "toolUse", message: { ...session.out, stopReason: "toolUse" } });
-				break;
-			}
-			case "turnDone":
-				settle(session, { type: "done", reason: "stop", message: { ...session.out, stopReason: "stop" } });
-				disposeSession(session);
-				break;
-			case "error":
-				settle(session, { type: "error", reason: "error", error: newOut(model, "error", action.message) });
-				disposeSession(session);
-				break;
-		}
+		sandbox: "read-only",
+		ephemeral: true,
+		dynamicTools: [{ type: "namespace", name: "pi", description: "Tools provided by the Pi harness", tools: toDynamicToolSpecs(tools) }],
+		developerInstructions: "Use the pi namespace for all tool operations. Pi executes these tools with the calling session's permissions.",
+		// Native command execution must not bypass Pi's tool filters or approvals.
+		config: { "features.shell_tool": false, "features.multi_agent": false, web_search: "disabled" },
 	};
-	session.conn.onStderr = () => {};
-	if (options?.signal) {
-		const onAbort = () => {
-			if (session.turnId) session.conn.notify("turn/interrupt", { threadId: session.threadId, turnId: session.turnId });
-			settle(session, { type: "error", reason: "aborted", error: newOut(model, "aborted", "Operation aborted") });
-			disposeSession(session);
-		};
-		if (options.signal.aborted) onAbort();
-		else options.signal.addEventListener("abort", onAbort, { once: true });
-	}
 }
 
 function settle(session: Session, event: Parameters<AssistantMessageEventStream["push"]>[0]): void {
@@ -390,9 +310,75 @@ function settle(session: Session, event: Parameters<AssistantMessageEventStream[
 	session.stream.end();
 }
 
-function disposeSession(session: Session): void {
-	if (session.heldToolCall) sessionsByCall.delete(session.heldToolCall.callId);
+function dispose(session: Session): void {
+	if (session.disposed) return;
+	session.disposed = true;
+	session.clearAbort();
+	if (session.held) sessionsByCall.delete(session.held.callId);
+	session.inbox.length = 0;
 	session.conn.kill();
+}
+
+function fail(session: Session, model: Model<any>, err: unknown, aborted = false): void {
+	settle(session, { type: "error", reason: aborted ? "aborted" : "error", error: newOut(model, aborted ? "aborted" : "error", err instanceof Error ? err.message : String(err)) });
+	dispose(session);
+}
+
+function bindAbort(session: Session, model: Model<any>, signal?: AbortSignal): void {
+	session.clearAbort();
+	const abort = () => fail(session, model, new Error("Operation aborted"), true);
+	session.clearAbort = () => signal?.removeEventListener("abort", abort);
+	if (signal?.aborted) abort();
+	else signal?.addEventListener("abort", abort, { once: true });
+}
+
+/** Buffer messages while Pi executes a tool. Parallel calls must not be dropped. */
+function pump(session: Session, model: Model<any>): void {
+	while (!session.settled && !session.disposed && session.inbox.length) {
+		const action = mapCodexMessage(session.inbox.shift()!);
+		if (!action) continue;
+		const ci = session.out.content.length;
+		switch (action.kind) {
+			case "text":
+				session.out.content.push({ type: "text", text: action.delta });
+				session.stream.push({ type: "text_start", contentIndex: ci, partial: session.out });
+				session.stream.push({ type: "text_delta", contentIndex: ci, delta: action.delta, partial: session.out });
+				session.stream.push({ type: "text_end", contentIndex: ci, content: action.delta, partial: session.out });
+				break;
+			case "thinking":
+				session.out.content.push({ type: "thinking", thinking: action.delta });
+				session.stream.push({ type: "thinking_start", contentIndex: ci, partial: session.out });
+				session.stream.push({ type: "thinking_delta", contentIndex: ci, delta: action.delta, partial: session.out });
+				session.stream.push({ type: "thinking_end", contentIndex: ci, content: action.delta, partial: session.out });
+				break;
+			case "usage":
+				session.out.usage.totalTokens = action.last;
+				break;
+			case "toolcall": {
+				if (action.namespace !== "pi" || !session.tools.has(action.tool) || !action.callId) {
+					session.conn.respond(action.id, { success: false, contentItems: [{ type: "inputText", text: "Tool is not available in the calling Pi session" }] });
+					break;
+				}
+				const piCallId = `${session.threadId}:${action.callId}`;
+				const toolCall = { type: "toolCall" as const, id: piCallId, name: action.tool, arguments: action.args as Record<string, unknown> };
+				session.out.content.push(toolCall);
+				session.stream.push({ type: "toolcall_start", contentIndex: ci, partial: session.out });
+				session.stream.push({ type: "toolcall_delta", contentIndex: ci, delta: JSON.stringify(action.args), partial: session.out });
+				session.stream.push({ type: "toolcall_end", contentIndex: ci, toolCall, partial: session.out });
+				session.held = { callId: piCallId, requestId: action.id };
+				sessionsByCall.set(piCallId, session);
+				session.out.stopReason = "toolUse";
+				settle(session, { type: "done", reason: "toolUse", message: session.out });
+				break;
+			}
+			case "turnDone":
+				session.out.stopReason = "stop";
+				settle(session, { type: "done", reason: "stop", message: session.out });
+				dispose(session);
+				break;
+			case "error": fail(session, model, action.message); break;
+		}
+	}
 }
 
 export function streamCodexAppServer(model: Model<any>, context: Context, options?: SimpleStreamOptions): AssistantMessageEventStream {
@@ -402,41 +388,60 @@ export function streamCodexAppServer(model: Model<any>, context: Context, option
 }
 
 async function run(model: Model<any>, context: Context, options: SimpleStreamOptions | undefined, stream: AssistantMessageEventStream): Promise<void> {
+	let session: Session | undefined;
 	try {
 		const parked = parkedToolResult(context);
-		if (parked && sessionsByCall.has(parked.callId)) {
-			// --- tool-loop continuation: resolve codex's held request, same turn ---
-			const session = sessionsByCall.get(parked.callId)!;
+		if (parked) {
+			session = sessionsByCall.get(parked.callId);
+			if (!session || session.disposed) throw new Error("Codex tool continuation is unavailable. Start a new user turn.");
+			const held = session.held!;
 			sessionsByCall.delete(parked.callId);
-			const held = session.heldToolCall!;
-			session.heldToolCall = null;
+			session.held = null;
 			session.stream = stream;
 			session.out = newOut(model, "stop");
-			session.contentIndex = 0;
 			session.settled = false;
-			session.conn.respond(held.requestId, { contentItems: [{ type: "inputText", text: parked.text }], success: true });
+			session.tools = new Set(currentTools(context).map((t) => t.name));
+			bindAbort(session, model, options?.signal);
+			if (session.disposed) return;
+			session.conn.respond(held.requestId, { contentItems: parked.contentItems, success: parked.success });
+			pump(session, model);
 			return;
 		}
-		// --- fresh Pi turn: new codex thread seeded with full history ---
+		if (options?.signal?.aborted) throw new Error("Operation aborted");
 		const tools = currentTools(context);
-		const conn = new AppServerConn(CODEX_BIN, ["app-server"]);
-		const cwd = process.cwd();
-		const threadId = await registerToolsAndStartThread(conn, cwd, model, tools);
-		const session: Session = { conn, threadId, turnId: null, heldToolCall: null, stream, out: newOut(model, "stop"), contentIndex: 0, settled: false };
-		drive(session, model, options);
-		const turn = (await conn.request("turn/start", { threadId, input: toTurnInput(serializeHistory(context)) })) as { turn?: { id?: string } };
-		session.turnId = turn?.turn?.id ?? null;
+		const conn = new AppServerConn(CODEX_BIN);
+		session = { conn, stream, out: newOut(model, "stop"), threadId: "", held: null, inbox: [], settled: false, disposed: false, clearAbort: () => {}, tools: new Set(tools.map((t) => t.name)) };
+		const active = session;
+		conn.onFailure = (err) => fail(active, model, err);
+		conn.onMessage = (msg) => {
+			if (active.disposed) return;
+			// Reject unsupported server requests so a native approval cannot hang the stream.
+			if (msg.id !== undefined && msg.method && msg.method !== "item/tool/call") {
+				fail(active, model, `Unsupported Codex server request: ${msg.method}`);
+				return;
+			}
+			active.inbox.push(msg);
+			try { pump(active, model); } catch (err) { fail(active, model, err); }
+		};
+		bindAbort(active, model, options?.signal);
+		if (active.disposed) return;
+		await conn.request("initialize", { clientInfo: { name: "pi-codex-bridge", title: "Pi Codex bridge", version: "0.2.0" }, capabilities: { experimentalApi: true } });
+		conn.notify("initialized", {});
+		const started = await conn.request("thread/start", threadStartParams(process.cwd(), model, tools)) as { thread?: { id?: string } };
+		if (!started.thread?.id) throw new Error("thread/start returned no thread id");
+		active.threadId = started.thread.id;
+		await conn.request("turn/start", { threadId: active.threadId, input: toTurnInput(serializeHistory(context)) });
 	} catch (err) {
-		stream.push({ type: "error", reason: "error", error: newOut(model, "error", err instanceof Error ? err.message : String(err)) });
-		stream.end();
+		if (session) fail(session, model, err, options?.signal?.aborted);
+		else {
+			const aborted = options?.signal?.aborted;
+			stream.push({ type: "error", reason: aborted ? "aborted" : "error", error: newOut(model, aborted ? "aborted" : "error", err instanceof Error ? err.message : String(err)) });
+			stream.end();
+		}
 	}
 }
 
-/** Pi exposes tools in the transcript system messages; getCurrentTools reads them. */
-function currentTools(context: Context): PiTool[] {
-	try {
-		return (getCurrentTools(context.messages) as unknown as PiTool[]) ?? [];
-	} catch {
-		return [];
-	}
+/** Normalize Context.tools before applying transcript tool additions/removals. */
+export function currentTools(context: Context): PiTool[] {
+	return getCurrentTools(normalizeContext(context).messages);
 }
