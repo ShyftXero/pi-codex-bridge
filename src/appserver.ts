@@ -199,7 +199,7 @@ function tokenTotal(breakdown: unknown): number {
 type RequestId = number | string;
 
 /** Child exit, spawn failure and broken stdin reject all outstanding RPCs. */
-class AppServerConn {
+export class AppServerConn {
 	private proc: ChildProcess;
 	private nextId = 1;
 	private failure: Error | null = null;
@@ -264,8 +264,8 @@ class AppServerConn {
 		this.proc.stdin!.write(JSON.stringify(obj) + "\n");
 	}
 
-	kill(): void {
-		this.fail(new Error("Codex app-server disposed"));
+	kill(reason = new Error("Codex app-server disposed")): void {
+		this.fail(reason);
 		this.proc.kill("SIGTERM");
 	}
 }
@@ -284,7 +284,7 @@ interface Session {
 }
 
 const sessionsByCall = new Map<string, Session>();
-const CODEX_BIN = process.env.PI_CODEX_BIN ??
+export const CODEX_BIN = process.env.PI_CODEX_BIN ??
 	[join(homedir(), ".local/node/bin/codex"), join(homedir(), ".local/bin/codex")].find(existsSync) ?? "codex";
 
 function newOut(model: Model<any>, stopReason: AssistantMessage["stopReason"], errorMessage?: string): AssistantMessage {
