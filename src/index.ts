@@ -14,6 +14,7 @@ import {
 } from "@earendil-works/pi-ai";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { currentTools, streamCodexAppServer } from "./appserver.js";
+import { registerMcpGateway } from "./mcp-gateway.js";
 
 const PROVIDER_ID = "codex";
 const API = "codex-bridge";
@@ -218,6 +219,7 @@ const streamFn = (model: Model<any>, context: Context, options?: SimpleStreamOpt
 		: streamCodexAppServer(model, context, options);
 
 export default function activate(pi: ExtensionAPI): void {
+	registerMcpGateway(pi);
 	pi.registerProvider(PROVIDER_ID, {
 		baseUrl: API,
 		apiKey: "not-used", // codex authenticates itself (ChatGPT OAuth in ~/.codex/auth.json)
